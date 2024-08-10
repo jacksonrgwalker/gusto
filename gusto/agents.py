@@ -1,57 +1,13 @@
 import logging
+from typing import Type
 
 import openai
-
 from openai.types.chat.chat_completion import ChatCompletion
-from openai.types.chat.chat_completion_message_tool_call import (
-    ChatCompletionMessageToolCall,
-)
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from .tools import BaseTool, ToolUsageError
 from .types.chat_messages import ToolCall
-
-
-@staticmethod
-def track_recursion_depth(func):
-    """
-    Decorator to track recursion depth.
-    Raises a AgentError if the max recursion depth is reached.
-    """
-
-    def wrapper(self, *args: list, **kwargs: dict):
-        self._recursion_depth += 1
-        if self._recursion_depth > self._max_recursion_depth:
-            raise self.AgentError(
-                f"Max recursion depth of {self._max_recursion_depth} reached."
-            )
-
-        result = func(self, *args, **kwargs)
-        self._recursion_depth -= 1
-        return result
-
-    return wrapper
-
-
-def get_tool_schema(tool_classes):
-    """
-    Extracts the name, description, and json-schema of the tools,
-    and formats them into a json dict format for the LLM providers.
-    """
-    tools_schemas = [
-        {
-            "name": tool.get_name(),
-            "description": tool.get_description(),
-            "parameters": tool.model_json_schema(),
-        }
-        for tool in tool_classes
-    ]
-
-    tool_schema = [
-        {"type": "function", "function": func_schema} for func_schema in tools_schemas
-    ]
-
-    return tool_schema
+from .utils import get_tool_schema, track_recursion_depth
 
 
 class Agent:
@@ -122,16 +78,14 @@ class Agent:
         else:
             return logging.getLogger(__name__)
 
-    def _get_tool_call_secret_kwargs(
-        self, tool_call: ChatCompletionMessageToolCall
-    ) -> dict:
+    def _get_tool_call_secret_kwargs(self, tool_call: ToolCall) -> dict:
         """
         Get the secret kwargs for the tool call.
         Made to be overridden by the child class.
 
         Parameters
         ----------
-        tool_call : ChatCompletionMessageToolCall
+        tool_call : ToolCall
             The openai tool call object
         """
         secret_kwargs = {"self": self, "tool_call": tool_call}
@@ -318,7 +272,12 @@ class Agent:
 
         return tools_dict
 
-    def _get_llm_response(self, messages: list, llm_params: dict) -> ChatCompletion:
+    def _get_llm_response(
+        self,
+        messages: list,
+        llm_params: dict,
+        response_format: Type[BaseModel] | None = None,
+    ) -> ChatCompletion:
         """
         Get the LLM response from the provider.
         Currently this only supports OpenAI's API, but later on
@@ -326,9 +285,19 @@ class Agent:
         """
 
         self.logger.info("Sending LLM request...")
-        response: ChatCompletion = self.llm_client.chat.completions.create(
-            messages=messages, **llm_params
-        )
+
+        if response_format:
+            response = self.llm_client.beta.chat.completions.parse(
+                messages=self.messages,
+                **self.llm_params,
+                response_format=response_format,
+            )
+
+        else:
+            response: ChatCompletion = self.llm_client.chat.completions.create(
+                messages=messages, **llm_params
+            )
+
         self.logger.info(
             "Received LLM response. Token Usage: "
             f"{response.usage.prompt_tokens:,} In + "
@@ -337,6 +306,34 @@ class Agent:
         )
 
         return response
+
+    def _request_tool_message(
+        self,
+        tool: BaseTool,
+    ):
+        tool_name = tool.get_name()
+        self.force_tool_usage(tool_name)
+        response = self.complete_chat()
+
+        if response:
+            # if we are allow the chain to continue
+            self.add_assistant_message_from_response(response)
+
+    def _request_structured_message(
+        self,
+        response_format: Type[BaseModel],
+    ):
+        if self.llm_params["model"] not in ["gpt-4o-mini", "gpt-4o-2024-08-06,"]:
+            raise ValueError(
+                f"Structured messages are only supported for the following models: "
+                f"'gpt-4o-mini', 'gpt-4o-2024-08-06', not {self.llm_params['model']}"
+            )
+        response = self._get_llm_response(
+            messages=self.messages,
+            llm_params=self.llm_params,
+            response_format=response_format,
+        )
+        self.add_assistant_message_from_response(response)
 
     def get_total_usage(
         self,
@@ -384,11 +381,7 @@ class Agent:
         """
         self.messages.append({"role": "user", "content": content})
 
-    def add_assistant_message(
-        self,
-        content: str,
-        tool_calls=None,
-    ) -> None:
+    def add_assistant_message(self, content: str, tool_calls: list[ToolCall]) -> None:
         """
         Add an assistant message to the messages list
 
@@ -397,7 +390,7 @@ class Agent:
         content : str
             The content of the assistant message
 
-        tools_calls : list, optional
+        tools_calls : list[BaseModel | dict] | None
             A list of tool calls to make.
             These are when the LLM wants to call a tool.
             By default, we don't inlcude any tool calls.
@@ -413,16 +406,14 @@ class Agent:
             # convert the tool calls to a model dump (dict)
             _tool_calls = []
             for tool_call in tool_calls:
-                if isinstance(tool_call, ChatCompletionMessageToolCall) or isinstance(
-                    tool_call, ToolCall
-                ):
+                if isinstance(tool_call, BaseModel):
                     tool_call = tool_call.model_dump()
                     _tool_calls.append(tool_call)
                 elif isinstance(tool_call, dict):
                     _tool_calls.append(tool_call)
                 else:
                     raise ValueError(
-                        f"Tool call must be of type ChatCompletionMessageToolCall or dict, not {type(tool_call)}"
+                        f"Tool call must be of type BaseModel or dict, not {type(tool_call)}"
                     )
 
             msg["tool_calls"] = _tool_calls
@@ -535,3 +526,48 @@ class Agent:
             return self._handle_tool_calls(response)
 
         return response
+
+    def request_message(
+        self,
+        conform_to: BaseTool | Type[BaseModel] | None,
+    ):
+        """
+        Request a message from the agent that conforms to the specified type,
+        and add it to the messages list.
+
+        Parameters
+        ----------
+        conform_to : BaseTool | BaseModel | None
+            The type of message to request.
+            If BaseTool: forces tool usage.
+                Forces the agent to use the specified tool during the next message.
+                Further behavior is dependant on the tool's configuration
+                (e.g. stop_chain_after, add_output_to_messages_after).
+                If a chat message is generated, it will be added to the messages list.
+            If Pydantic Model: forces structured output.
+                Forces the agent to return a structured message that conforms to the
+                specified model. This is useful when you want to get a specific
+                type of output from the agent, e.g. a structured response that can be
+                used in a downstream system. The message will be added to the messages
+                list, and the chain will end.
+                If a chat message is generated, it will be added to the messages list.
+            If None: the chat is completed.
+                Use this when you want the agent to decide what to do next.
+                The agent will either
+                    1. respond directly by an assistant message with content, or
+                    2. call a tool (if available), with further behavior dependant
+                       on said tool's configuration (see `If BaseTool`).
+        """
+        if isinstance(conform_to, BaseTool):
+            self._request_tool_message(conform_to)
+
+        elif issubclass(conform_to, BaseModel):
+            self._request_structured_message(conform_to)
+
+        elif conform_to is None:
+            self.complete_chat()
+
+        else:
+            raise ValueError(
+                f"conform_to must be of type BaseTool or a subclass of pydantic.BaseModel, not {type(conform_to)}"
+            )
